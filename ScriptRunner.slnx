@@ -1,0 +1,5 @@
+<Solution>
+  <Project Path="Builder/Builder.csproj" />
+  <Project Path="BuilderAPI/BuilderAPI.csproj" />
+  <Project Path="BuilderAPIData/BuilderAPIData.csproj" />
+</Solution>
