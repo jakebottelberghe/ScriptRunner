@@ -9,7 +9,7 @@ namespace BuilderAPI
     {
         internal class Node
         {
-            public ScriptFile? ScriptFile { get; set; }
+            public ScriptFile ScriptFile { get; set; }
             public Func<int, bool> ShouldRun { get; set; } = (int _) => { return true; };
         }
 

@@ -17,7 +17,7 @@ namespace BuilderAPI
         public File(FileRecord file)
         {
             FileInfo = file;
-            LastUpdate = file.LastUpdate;
+            LastUpdate = DateTime.Now;
             Hash = 0;
         }
 

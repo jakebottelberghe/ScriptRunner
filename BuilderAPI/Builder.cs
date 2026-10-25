@@ -1,13 +1,5 @@
 ﻿using BuilderAPIData;
-using Microsoft.CodeAnalysis.CSharp.Syntax;
-using Microsoft.Extensions.Logging;
-using System;
 using System.Collections.Concurrent;
-using System.Collections.Generic;
-using System.Diagnostics.Contracts;
-using System.IO.Pipelines;
-using System.Text;
-using static System.Net.WebRequestMethods;
 
 namespace BuilderAPI
 {
@@ -24,6 +16,17 @@ namespace BuilderAPI
         internal HashSet<TriggerRecord> Triggers { get; init; } = new ();
         internal FileMonitor TriggerMonitor { get; init; } = new ();
 
+        public Builder()
+        {
+            ProgressionManager.CreateChannel<PipelineProgressionRecord>();
+            ProgressionManager.CreateChannel<AssetChangeRecord<FileRecord>>();
+            ProgressionManager.CreateChannel<AssetChangeRecord<LoggerRecord>>();
+            ProgressionManager.CreateChannel<AssetChangeRecord<TriggerRecord>>();
+            ProgressionManager.CreateChannel<AssetChangeRecord<ParameterRecord>>();
+            ProgressionManager.CreateChannel<PipelineChangeRecord>();
+
+        }
+
         public void StartFileMonitor(string root)
         {
             TriggerMonitor.EventHanderCallback.Add(FileTriggerHandler);
@@ -34,11 +37,13 @@ namespace BuilderAPI
         public void AddFile(FileRecord file)
         {
             Files[file] = new File(file);
+            ProgressionManager.Write(new AssetChangeRecord<FileRecord>(file, AssetProgressStatus.Created));
             Files[file].Hash = Files[file].GenerateHash();
         }
 
         public void RemoveFile(FileRecord file)
         {
+            ProgressionManager.Write(new AssetChangeRecord<FileRecord>(file, AssetProgressStatus.Deleted));
             Files.Remove(file);
         }
 
@@ -46,34 +51,38 @@ namespace BuilderAPI
         {
             return Files.Keys.Where(file =>
             {
-                return file.Tags.Intersect(selectionTags).Any();
+                return DoTagMatch(file.Tags, selectionTags);
             }).ToList();
         }
 
         public void AddScript(FileRecord file)
         {
             var script = new ScriptFile(file, Path.Combine("cache", file.Name), CurrentLogger);
+            ProgressionManager.Write(new AssetChangeRecord<FileRecord>(file, AssetProgressStatus.Created));
             Scripts[script.FileInfo] = script;
         }
         public void RemoveScript(FileRecord file)
         {
+            ProgressionManager.Write(new AssetChangeRecord<FileRecord>(file, AssetProgressStatus.Created));
             Scripts.Remove(file);
         }
         public List<FileRecord> GetScripts(List<string> selectionTags)
         {
             return Scripts.Keys.Where(file =>
             {
-                return file.Tags.Intersect(selectionTags).Any();
+                return DoTagMatch(file.Tags, selectionTags);
             }).ToList();
         }
 
         // Parameter management
         public void AddParameter(ParameterRecord parameter)
         {
+            ProgressionManager.Write(new AssetChangeRecord<ParameterRecord>(parameter, AssetProgressStatus.Created));
             Parameters.Add(parameter);
         }
         public void RemoveParameter(ParameterRecord parameter)
         {
+            ProgressionManager.Write(new AssetChangeRecord<ParameterRecord>(parameter, AssetProgressStatus.Deleted));
             Parameters.Remove(parameter);
         }
         public List<ParameterRecord> GetParameter(List<string> selectionTags)
@@ -84,17 +93,19 @@ namespace BuilderAPI
         // Logging management
         public void AddLogFunction(LoggerRecord log)
         {
+            ProgressionManager.Write(new AssetChangeRecord<LoggerRecord>(log, AssetProgressStatus.Created));
             LogFunctions.Add(log);
         }
         public void RemoveLogFunction(LoggerRecord log)
         {
+            ProgressionManager.Write(new AssetChangeRecord<LoggerRecord>(log, AssetProgressStatus.Deleted));
             LogFunctions.Remove(log);
         }
         public List<LoggerRecord> GetLogFunction(List<string> loggerTags)
         {
             return LogFunctions.Where(log =>
             {
-                return log.Tags.Intersect(loggerTags).Any();
+                return DoTagMatch(log.Tags, loggerTags);
             }).ToList();
         }
 
@@ -125,7 +136,7 @@ namespace BuilderAPI
         public void SetGlobalLogger(List<string> loggerTagSelect)
         {
             var temp = Loggers.Where( log => {
-                return log.Tags.Intersect(loggerTagSelect).Any();
+                return DoTagMatch(log.Tags, loggerTagSelect);
             }).ToList();
             if (temp.Count == 1) CurrentLogger = temp.First();
             else
@@ -141,19 +152,20 @@ namespace BuilderAPI
                     Critical = temp.SelectMany(i => i.Critical).ToList(),
                 };
             }
-
         }
 
         // Triggers management
         public void AddTrigger(TriggerRecord trigger)
         {
             if (Triggers.Contains(trigger)) return;
+            ProgressionManager.Write(new AssetChangeRecord<TriggerRecord>(trigger, AssetProgressStatus.Created));
             Triggers.Add(trigger);
             TriggersByPath.AddTrigger(trigger);
         }
 
         public void RemoveTrigger(TriggerRecord trigger)
         {
+            ProgressionManager.Write(new AssetChangeRecord<TriggerRecord>(trigger, AssetProgressStatus.Deleted));
             Triggers.Remove(trigger);
             TriggersByPath.RemoveTrigger(trigger);
         }
@@ -161,13 +173,44 @@ namespace BuilderAPI
         {
             return Triggers.Where(t =>
             {
-                return t.Tags.Intersect(triggerTags).Any();
+                return DoTagMatch(t.Tags, triggerTags);
             }).ToList();
+        }
+
+
+        public PipelineRecord? GetPipeline(string name)
+        {
+            if (!Pipelines.ContainsKey(name)) return null;
+            var p = Pipelines[name];
+            List<PipelineStageRecord> stags = p.Steps.Select(s =>
+            {
+                var pars = GetParameter(s.ParameterTags);
+                List<FileRecord> files = s.Nodes.Select(n => n.ScriptFile.FileInfo).ToList();
+                return new PipelineStageRecord(s.Name, s.Tags, pars, files);
+            }).ToList();
+            return new PipelineRecord(p.Name, p.Tags, stags);
+        }
+
+        public List<PipelineRecord> GetPipelines(List<string> tags)
+        {
+            return Pipelines.Values
+                .Where( p => { return DoTagMatch(p.Tags, tags); } )
+                .Select( p =>
+                {
+                    List<PipelineStageRecord> stags = p.Steps.Select(s =>
+                    {
+                        var pars = GetParameter(s.ParameterTags);
+                        List<FileRecord> files = s.Nodes.Select(n => n.ScriptFile.FileInfo).ToList();
+                        return new PipelineStageRecord(s.Name, s.Tags, pars, files);
+                    }).ToList();
+                    return new PipelineRecord(p.Name, p.Tags, stags);
+                }).ToList();
         }
 
         // Pipeline creation
         public void CreatePipeline(string name, List<string> pipelineTags)
         {
+            ProgressionManager.Write(new PipelineChangeRecord(name, string.Empty, int.MinValue, AssetProgressStatus.Created));
             Pipelines[name] = new Pipeline() { Tags = pipelineTags, Name = name};
         }
 
@@ -175,6 +218,7 @@ namespace BuilderAPI
         {
             var pipeline = Pipelines[pipelineName];
             if (pipeline == null) return;
+            ProgressionManager.Write(new PipelineChangeRecord(pipelineName, step, int.MinValue, AssetProgressStatus.Modified));
             pipeline.Steps.Add(new PipelineNode() { Name = step, ValidateOutput = isValidOutput, ParameterTags = parameterSelectionTags, Tags = stepTags });
         }
 
@@ -188,6 +232,7 @@ namespace BuilderAPI
             var step = pipeline.Steps.FirstOrDefault(s => s.Name.Equals(stepName));
             if (step == null) return;
 
+            ProgressionManager.Write(new PipelineChangeRecord(pipelineName, stepName, step.Nodes.Count + 1, AssetProgressStatus.Modified));
             step.Nodes.Add(new PipelineNode.Node() { ScriptFile = Scripts[script], ShouldRun = shouldRun });
         }
 
@@ -213,7 +258,7 @@ namespace BuilderAPI
         {
             var pipelines = Pipelines.Values.Where(p =>
             {
-                return p.Tags.Intersect(pipelineTags).Any();
+                return DoTagMatch(p.Tags, pipelineTags);
             }).ToList();
 
             if (!pipelines.Any()) return 0;
@@ -224,7 +269,7 @@ namespace BuilderAPI
         {
             var pipelines = Pipelines.Values.Where(p =>
             {
-                return p.Tags.Intersect(pipelineTags).Any();
+                return DoTagMatch(p.Tags, pipelineTags);
             }).ToList();
 
             if (!pipelines.Any()) return 0;
@@ -235,16 +280,15 @@ namespace BuilderAPI
         {
             if (stepSelctionTags.Any())
             {
-                var progressionLogger = Loggers.FirstOrDefault(l => l.Tags.Contains("_progression"));
                 ConcurrentDictionary<string, List<int>> parallelData = new ConcurrentDictionary<string, List<int>>();
                 Parallel.ForEachAsync(pipelines, async (pl, ct) =>
                 {
                     var steps = pl.Steps.Where(s =>
                     {
-                        return s.Tags.Intersect(stepSelctionTags).Any();
+                        return DoTagMatch(s.Tags, stepSelctionTags);
                     }).ToList();
-
-                    parallelData.TryAdd(pl.Name, await RunSteps(steps, action, files, parameters, progressionLogger, pl.Name));
+                    var progression = new PipelineProgressionRecord(pl.Name, string.Empty, int.MinValue, PipelineProgression.Running);
+                    parallelData.TryAdd(pl.Name, await RunSteps(steps, action, files, parameters, progression));
                 }).GetAwaiter().GetResult();
 
             };
@@ -254,12 +298,12 @@ namespace BuilderAPI
         private int RunPipelines(IEnumerable<Pipeline> pipelines, string stepName, int action, List<FileRecord> files, List<ParameterRecord> parameters)
         {
             ConcurrentDictionary<string, List<int>> parallelData = new ConcurrentDictionary<string, List<int>>();
-            var progressionLogger = Loggers.FirstOrDefault(l => l.Tags.Contains("_progression"));
             if (string.IsNullOrEmpty(stepName))
             {
                 Parallel.ForEachAsync(pipelines, async (pl, ct) =>
                 {
-                    parallelData.TryAdd(pl.Name, await RunSteps(pl.Steps, action, files, parameters, progressionLogger, pl.Name));
+                    var progression = new PipelineProgressionRecord(pl.Name, string.Empty, int.MinValue, PipelineProgression.Running);
+                    parallelData.TryAdd(pl.Name, await RunSteps(pl.Steps, action, files, parameters, progression));
                 }).GetAwaiter().GetResult();
             }
             else
@@ -267,13 +311,14 @@ namespace BuilderAPI
                 Parallel.ForEachAsync(pipelines, async (pl, ct) =>
                 {
                     var steps = pl.Steps.Where(step => { return !string.IsNullOrEmpty(step.Name) && string.Compare(step.Name, stepName) == 0; });
-                    parallelData.TryAdd(pl.Name, await RunSteps(steps, action, files, parameters, progressionLogger, pl.Name));
+                    var progression = new PipelineProgressionRecord(pl.Name, string.Empty, int.MinValue, PipelineProgression.Running);
+                    parallelData.TryAdd(pl.Name, await RunSteps(steps, action, files, parameters, progression));
                 }).GetAwaiter().GetResult();
             }
             return -1;
         }
 
-        private async Task<List<int>> RunSteps(IEnumerable<PipelineNode> nodes, int actionToRun, List<FileRecord> files, List<ParameterRecord> parameters, Logger? progLogger, string plName )
+        private async Task<List<int>> RunSteps(IEnumerable<PipelineNode> nodes, int actionToRun, List<FileRecord> files, List<ParameterRecord> parameters, PipelineProgressionRecord progression )
         {
             List<int> stepOutput = new ();
             foreach (PipelineNode node in nodes)
@@ -281,19 +326,25 @@ namespace BuilderAPI
                 var filterParams = FilterParameters(parameters, node.ParameterTags);
                 if(actionToRun >= 0)
                 {
+                    var running = progression with { Stage = node.Name, Action = actionToRun };
+                    ProgressionManager.Write(running);
                     var retValue = await node.Nodes[actionToRun].ScriptFile.Run(files, filterParams, this, CurrentLogger);
+
+                    var result = running with { Progression = PipelineProgression.Completed, Results = retValue };
+                    ProgressionManager.Write(result);
+
                     stepOutput.Add(retValue);
-                    progLogger?.LogFunc(LogLevel.Information, "{Pipeline}:{Step}:{Action}-Ran with return value {Value}", null, [plName, node.Name, actionToRun, retValue]);
                 }
                 else
                 {
-                    stepOutput.Add( await RunActions(node.Nodes, files, filterParams, progLogger, plName, node.Name));
+                    var tempAction = progression with { Stage = node.Name };
+                    stepOutput.Add( await RunActions(node.Nodes, files, filterParams, tempAction));
                 }
             }
             return stepOutput;
         }
 
-        private async Task<int> RunActions(List<PipelineNode.Node> nodes, List<FileRecord> files, List<ParameterRecord> parameters, Logger? progLogger, string plName, string stepName)
+        private async Task<int> RunActions(List<PipelineNode.Node> nodes, List<FileRecord> files, List<ParameterRecord> parameters, PipelineProgressionRecord progres )
         {
             int retValue = int.MinValue;
             for(var i = 0; i < nodes.Count; ++i)
@@ -301,45 +352,19 @@ namespace BuilderAPI
                 var node = nodes[i];
                 if (retValue == int.MinValue || node.ShouldRun(retValue))
                 {
+                    var running = progres with { Action = i };
+                    ProgressionManager.Write(running);
                     retValue = await node.ScriptFile.Run(files, parameters, this, CurrentLogger);
-                    progLogger?.LogFunc(LogLevel.Information, "{Pipeline}:{Step}:{Action}-Did step Run:{Ran}-Step returned value:{Value}", null, [plName, stepName, i, true, retValue]);
+                    var complete = running with { Progression = PipelineProgression.Completed, Results = retValue };
+                    ProgressionManager.Write(complete);
                 }
                 else
                 {
-                    progLogger?.LogFunc(LogLevel.Information, "{Pipeline}:{Step}:{Action}-Did step run:{Ran}-Step filtered because of return value:{Value}", null, [plName, stepName, i, false, retValue]);
-                    break;
+                    var skipped = progres with { Action = i, Progression = PipelineProgression.Skipped };
+                    ProgressionManager.Write(skipped);
                 }
             }
             return retValue;
-        }
-
-        
-        private async Task<int> RunPipelineAtStep(Pipeline pipeline, int startStep, List<FileRecord> files, List<ParameterRecord> parameters)
-        {
-            var totalSteps = pipeline.Steps.Count;
-            if (totalSteps <= startStep) return -1;
-            for(var i = startStep; i < pipeline.Steps.Count; ++i)
-            {
-                var step = pipeline.Steps[i];
-                pipeline.LastResult = await RunStep(pipeline.LastResult, step, files, parameters);
-
-                if (!step.ValidateOutput(pipeline.LastResult)) break;
-            }
-            return pipeline.LastResult;
-        }
-
-        private async Task<int> RunStep(int lastResult, PipelineNode step, List<FileRecord> files, List<ParameterRecord> parameters)
-        {
-            var paramsForStep = FilterParameters(parameters, step.ParameterTags);
-            foreach(var stepNode in step.Nodes)
-            {
-                if(stepNode.ShouldRun(lastResult))
-                {
-                    lastResult = await RunStepAction(stepNode, files, paramsForStep);
-                }
-            }
-
-            return lastResult;
         }
 
         private async Task<int> RunStepAction(PipelineNode.Node node, List<FileRecord> files, List<ParameterRecord> paramsForStep)
@@ -351,7 +376,7 @@ namespace BuilderAPI
         {
             return Parameters.Where(par =>
             {
-                return par.Tags.Intersect(tags).Any();
+                return DoTagMatch(par.Tags, tags);
             }).ToList();
         }
 
@@ -367,17 +392,19 @@ namespace BuilderAPI
 
         private void ApplyTrigger(MonitorRecord fileTrigger, TriggerRecord trigger)
         {
-            if (!trigger.TriggerTags.Intersect(fileTrigger.Tags).Any()) return;
+            if (DoTagMatch(fileTrigger.Tags, trigger.TriggerTags)) return;
             var now = DateTime.Now;
-            var ftRec = new FileRecord(Path.GetFileNameWithoutExtension(fileTrigger.Name), fileTrigger.Path, Path.GetExtension(fileTrigger.Name), now, []);
+            var ftRec = new FileRecord(Path.GetFileNameWithoutExtension(fileTrigger.Name), fileTrigger.Path, Path.GetExtension(fileTrigger.Name), []);
             var files = Files.Keys
-                .Where(f => f with { LastUpdate = now, Tags = [] } == ftRec)
-                .Where(f => f.Tags.Intersect(trigger.FileTags).Any())
+                .Where(f => f with { Tags = [] } == ftRec)
+                .Where(f => DoTagMatch(f.Tags, trigger.FileTags))
                 .ToList();
-            
-            
         }
 
+        private bool DoTagMatch(List<string> assetTags, List<string> filterTags)
+        {
+            return assetTags.Intersect(filterTags).Count() == Math.Min(assetTags.Count, filterTags.Count);
+        }
         public void Dispose()
         {
             TriggerMonitor.Dispose();

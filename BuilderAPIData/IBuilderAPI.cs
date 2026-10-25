@@ -40,6 +40,9 @@ namespace BuilderAPIData
         );
         public void SetGlobalLogger(List<string> loggerTagSelect);
 
+        public List<PipelineRecord> GetPipelines(List<string> tags);
+        public PipelineRecord? GetPipeline(string name);
+
         // Pipeline creation
         public void CreatePipeline(string name, List<string> pipelineTags);
         public void AddStepToPipeline(string pipeline, string step, Func<int, bool> isValidOutput, List<string> parameterSelectionTags, List<string> stepTags);
